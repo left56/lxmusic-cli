@@ -1,0 +1,7 @@
+cli/target/
+dist/
+.DS_Store
+
+# 音源包和觅音源代码不入库
+miyin/
+miyin-sources-*.zip
