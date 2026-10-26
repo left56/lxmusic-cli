@@ -1,4 +1,4 @@
-//! 音频落下之后，旁边再写歌词、歌曲信息和封面。
+//! 音频落下之后，旁边再写歌词和封面，歌曲信息写进音频文件的标准标签。
 //! 这三样失败都不影响已经下好的音频，也不改音源状态。
 //!
 //! 歌词和封面先问音源的 `lyric` / `pic`（洛雪脚本约定）。
@@ -6,10 +6,14 @@
 //! `lx.env` 仍然是 `desktop`，这里不把它改成 `cli`。
 
 use crate::host::{browser_bytes, SourceSession};
-use crate::search::platform_label;
 use crate::store::Hit;
 use base64::Engine;
 use flate2::read::ZlibDecoder;
+use lofty::config::WriteOptions;
+use lofty::picture::{MimeType, Picture, PictureType};
+use lofty::prelude::*;
+use lofty::probe::Probe;
+use lofty::tag::Tag;
 use serde_json::{json, Value};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,7 +25,8 @@ const LYRIC_WAIT: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone, Default)]
 pub struct Attached {
-    pub info_path: Option<String>,
+    pub tagged: bool,
+    pub info_note: String,
     pub lyric_path: Option<String>,
     pub cover_path: Option<String>,
     pub lyric_note: String,
@@ -32,11 +37,6 @@ pub fn attach(
     session: Option<&SourceSession>,
     hit: &Hit,
     audio: &Path,
-    source: &str,
-    claimed: &str,
-    quality: &str,
-    fallback: bool,
-    note: &str,
     native_lyric: bool,
     progress: bool,
 ) -> Attached {
@@ -73,10 +73,8 @@ pub fn attach(
     if progress {
         eprintln!("  封面");
     }
-    let mut cover_url = None;
     let mut cover_err = None;
     for url in cover_candidates(session, hit, &info) {
-        cover_url = Some(url.clone());
         match save_cover(&url, &hit.platform, audio) {
             Ok(path) => {
                 attached.cover_path = Some(path.display().to_string());
@@ -92,25 +90,89 @@ pub fn attach(
         }
     }
 
-    let lyric_name = attached.lyric_path.as_deref().map(Path::new).map(file_name);
-    let cover_name = attached.cover_path.as_deref().map(Path::new).map(file_name);
-    let body = song_info(
-        hit,
-        audio,
-        source,
-        claimed,
-        quality,
-        fallback,
-        note,
-        lyric_name.as_deref(),
-        cover_name.as_deref(),
-        cover_url.as_deref(),
-    );
-    let info_path = sidecar(audio, "json");
-    if std::fs::write(&info_path, format!("{body}\n")).is_ok() {
-        attached.info_path = Some(info_path.display().to_string());
+    if progress {
+        eprintln!("  歌曲信息");
+    }
+    let cover_bytes = attached
+        .cover_path
+        .as_deref()
+        .and_then(|path| std::fs::read(path).ok());
+    match embed_tags(audio, hit, cover_bytes.as_deref()) {
+        Ok(()) => attached.tagged = true,
+        Err(err) if cover_bytes.is_some() => match embed_tags(audio, hit, None) {
+            Ok(()) => {
+                attached.tagged = true;
+                attached.info_note = format!("封面未写入标签（{err}）");
+            }
+            Err(err) => attached.info_note = missing(Some(err)),
+        },
+        Err(err) => attached.info_note = missing(Some(err)),
     }
     attached
+}
+
+fn embed_tags(audio: &Path, hit: &Hit, cover: Option<&[u8]>) -> Result<(), String> {
+    let mut tagged = Probe::open(audio)
+        .map_err(|err| brief(&err.to_string()))?
+        .guess_file_type()
+        .map_err(|err| brief(&err.to_string()))?
+        .read()
+        .map_err(|err| brief(&err.to_string()))?;
+    {
+        let tag = tag_slot(&mut tagged)?;
+        set_text(tag, hit);
+        if let Some(bytes) = cover {
+            if let Some(picture) = picture_from(bytes) {
+                tag.set_picture(0, picture);
+            }
+        }
+    }
+    tagged
+        .save_to_path(audio, WriteOptions::default())
+        .map_err(|err| brief(&err.to_string()))
+}
+
+fn tag_slot(tagged: &mut lofty::file::TaggedFile) -> Result<&mut Tag, String> {
+    if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
+        let tag_type = tagged.primary_tag_type();
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    if tagged.primary_tag().is_some() {
+        Ok(tagged.primary_tag_mut().expect("primary tag"))
+    } else {
+        tagged.first_tag_mut().ok_or_else(|| "无法创建标签".into())
+    }
+}
+
+fn set_text(tag: &mut Tag, hit: &Hit) {
+    let title = hit.title.trim();
+    let artist = hit.artist.trim();
+    let album = hit.album.trim();
+    if !title.is_empty() {
+        tag.set_title(title.to_string());
+    }
+    if !artist.is_empty() {
+        tag.set_artist(artist.to_string());
+    }
+    if !album.is_empty() {
+        tag.set_album(album.to_string());
+    }
+}
+
+fn picture_from(bytes: &[u8]) -> Option<Picture> {
+    let mime = match image_ext(bytes)? {
+        "jpg" => MimeType::Jpeg,
+        "png" => MimeType::Png,
+        "gif" => MimeType::Gif,
+        "webp" => MimeType::Unknown("image/webp".into()),
+        _ => return None,
+    };
+    Some(
+        Picture::unchecked(bytes.to_vec())
+            .pic_type(PictureType::CoverFront)
+            .mime_type(mime)
+            .build(),
+    )
 }
 
 fn music_info_for_lyric(hit: &Hit) -> Value {
@@ -178,40 +240,6 @@ fn save_cover(url: &str, platform: &str, audio: &Path) -> Result<PathBuf, String
     Ok(path)
 }
 
-fn song_info(
-    hit: &Hit,
-    audio: &Path,
-    source: &str,
-    claimed: &str,
-    quality: &str,
-    fallback: bool,
-    note: &str,
-    lyric: Option<&str>,
-    cover: Option<&str>,
-    cover_url: Option<&str>,
-) -> String {
-    let body = json!({
-        "title": hit.title,
-        "artist": hit.artist,
-        "album": hit.album,
-        "duration": hit.duration,
-        "platform": hit.platform,
-        "platformLabel": platform_label(&hit.platform),
-        "externalId": hit.external_id,
-        "quality": quality,
-        "claimedQuality": claimed,
-        "source": source,
-        "fallback": fallback,
-        "note": note,
-        "audio": file_name(audio),
-        "lyric": lyric,
-        "cover": cover,
-        "coverUrl": cover_url,
-        "musicInfo": hit.music_info,
-    });
-    serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into())
-}
-
 fn sidecar(audio: &Path, ext: &str) -> PathBuf {
     let stem = audio
         .file_stem()
@@ -223,13 +251,6 @@ fn sidecar(audio: &Path, ext: &str) -> PathBuf {
         Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
         _ => PathBuf::from(name),
     }
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string()
 }
 
 fn missing(err: Option<String>) -> String {

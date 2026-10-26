@@ -1,6 +1,6 @@
 //! 用搜索得到的短 id 下载。只使用已启用且不是 `dead` 的音源。
 //! 音质从高往低试。试听直接丢掉；声称和文件对不上时只留一个兜底。
-//! 下载失败不改音源状态。音频成功后默认再写歌词、歌曲信息和封面。
+//! 下载失败不改音源状态。音频成功后默认再写歌词、内嵌标签和封面。
 
 use crate::audio::{
     estimate_kbps, is_preview_clip, lossless_claim_mismatch, qualities_to_try, quality_from_bitrate,
@@ -21,7 +21,7 @@ pub struct DownloadOpts {
     pub out: Option<String>,
     pub quality: String,
     pub progress: bool,
-    /// 跟音频一起写 `.lrc`、歌曲信息 `.json` 和封面。命令行默认开。
+    /// 跟音频一起写 `.lrc`、标准内嵌标签和封面。命令行默认开。
     pub companions: bool,
     /// 音源没有歌词时再请求平台公开接口。测试里关掉，避免打到外网。
     pub native_lyric: bool,
@@ -43,7 +43,9 @@ pub struct DownloadReport {
     pub source: String,
     pub fallback: bool,
     pub note: String,
-    pub info_path: Option<String>,
+    /// 歌名、歌手、专辑和封面已写进音频文件的标准标签。
+    pub tagged: bool,
+    pub info_note: String,
     pub lyric_path: Option<String>,
     pub cover_path: Option<String>,
     pub lyric_note: String,
@@ -291,21 +293,11 @@ fn finish(
         return Err(err);
     }
     let attached = if opts.companions {
-        attach(
-            session,
-            hit,
-            &dest,
-            source,
-            claimed,
-            &judged.quality,
-            fallback,
-            &judged.note,
-            opts.native_lyric,
-            opts.progress,
-        )
+        attach(session, hit, &dest, opts.native_lyric, opts.progress)
     } else {
         Attached::default()
     };
+    let bytes = std::fs::metadata(&dest).map(|meta| meta.len()).unwrap_or(bytes);
     Ok(DownloadReport {
         id: hit.id.clone(),
         title: hit.title.clone(),
@@ -320,7 +312,8 @@ fn finish(
         source: source.to_string(),
         fallback,
         note: judged.note.clone(),
-        info_path: attached.info_path,
+        tagged: attached.tagged,
+        info_note: attached.info_note,
         lyric_path: attached.lyric_path,
         cover_path: attached.cover_path,
         lyric_note: attached.lyric_note,
@@ -544,6 +537,8 @@ fn discard(path: &Path) {
 mod tests {
     use super::*;
     use crate::store::{content_hash, NewSource};
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::Accessor;
     use serde_json::json;
     use std::collections::HashMap;
     use std::io::{Read, Write};
@@ -748,7 +743,7 @@ mod tests {
         let (dir, store) = temp_store();
         let out = dir.path().join("music");
         let server = Server::start(HashMap::from([
-            ("/128k".into(), padded(b"fLaC", 160_000)),
+            ("/128k".into(), mp3_body(160_000)),
             ("/cover.jpg".into(), vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0]),
         ]));
         insert(
@@ -780,24 +775,23 @@ mod tests {
         assert!(report.cover_note.is_empty());
         let lyric = std::fs::read_to_string(report.lyric_path.as_ref().unwrap()).unwrap();
         assert_eq!(lyric, "[00:01.00]晴天\n[00:01.00]Sunny\n[00:05.00]故事的小黄花\n");
-        let info: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(report.info_path.as_ref().unwrap()).unwrap()).unwrap();
-        assert_eq!(info["title"], "晴天");
-        assert_eq!(info["artist"], "周杰伦");
-        assert_eq!(info["album"], "叶惠美");
-        assert_eq!(info["platform"], "wy");
-        assert_eq!(info["platformLabel"], "网易云");
-        assert_eq!(info["quality"], "128k");
-        assert_eq!(info["source"], "本地歌词");
-        assert!(info["audio"].as_str().unwrap().ends_with(".flac"));
-        assert!(info["lyric"].as_str().unwrap().ends_with(".lrc"));
-        assert!(info["cover"].as_str().unwrap().ends_with(".jpg"));
+        assert!(report.tagged);
+        assert!(report.info_note.is_empty());
+        let tagged = lofty::read_from_path(&report.path).unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        assert_eq!(tag.title().as_deref(), Some("晴天"));
+        assert_eq!(tag.artist().as_deref(), Some("周杰伦"));
+        assert_eq!(tag.album().as_deref(), Some("叶惠美"));
+        assert!(tag.pictures()[0].data().starts_with(&[0xFF, 0xD8, 0xFF]));
         assert!(std::fs::read(report.cover_path.as_ref().unwrap()).unwrap().starts_with(&[0xFF, 0xD8, 0xFF]));
         assert_eq!(
             std::path::Path::new(report.lyric_path.as_ref().unwrap()).file_stem(),
             std::path::Path::new(&report.path).file_stem()
         );
-        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 4);
+        assert!(std::fs::read_dir(&out).unwrap().all(|entry| {
+            entry.unwrap().path().extension().and_then(|ext| ext.to_str()) != Some("json")
+        }));
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 3);
         assert_eq!(store.get_source_by_name("本地歌词").unwrap().unwrap().status, "unknown");
         drop(server);
     }
@@ -806,7 +800,7 @@ mod tests {
     fn keeps_the_audio_when_lyric_and_cover_are_missing() {
         let (dir, store) = temp_store();
         let out = dir.path().join("music");
-        let server = Server::start(HashMap::from([("/128k".into(), padded(b"fLaC", 160_000))]));
+        let server = Server::start(HashMap::from([("/128k".into(), mp3_body(160_000))]));
         insert(
             &store,
             "没有歌词",
@@ -827,17 +821,20 @@ mod tests {
         hit.music_info = json!({"name": "晴天", "singer": "周杰伦", "source": "wy"});
         store.upsert_hit(&hit).unwrap();
         let report = download(&store, &id, &companion_opts(&out)).unwrap();
-        assert!(report.path.ends_with(".flac"));
+        assert!(report.path.ends_with(".mp3"));
         assert!(report.lyric_path.is_none());
         assert!(report.lyric_note.starts_with("未获取"));
         assert!(report.cover_path.is_none());
         assert!(report.cover_note.is_empty());
-        let info: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(report.info_path.as_ref().unwrap()).unwrap()).unwrap();
-        assert_eq!(info["title"], "晴天");
-        assert!(info["lyric"].is_null());
-        assert!(info["cover"].is_null());
-        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+        assert!(report.tagged);
+        assert!(report.info_note.is_empty());
+        let tagged = lofty::read_from_path(&report.path).unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        assert_eq!(tag.title().as_deref(), Some("晴天"));
+        assert_eq!(tag.artist().as_deref(), Some("周杰伦"));
+        assert_eq!(tag.album().as_deref(), Some("叶惠美"));
+        assert!(tag.pictures().is_empty());
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
         assert_eq!(store.get_source_by_name("没有歌词").unwrap().unwrap().status, "unknown");
         drop(server);
     }
@@ -861,6 +858,20 @@ mod tests {
             lx.send('inited', {{ sources: {{ wy: {{ qualitys: {qualities} }} }} }})
             "#
         )
+    }
+
+    fn mp3_body(min_len: usize) -> Vec<u8> {
+        // MPEG-1 Layer III, 128 kbps, 44100 Hz, stereo, no padding.
+        let mut frame = vec![0u8; 417];
+        frame[0] = 0xFF;
+        frame[1] = 0xFB;
+        frame[2] = 0x90;
+        frame[3] = 0x04;
+        let mut body = Vec::new();
+        while body.len() < min_len {
+            body.extend_from_slice(&frame);
+        }
+        body
     }
 
     fn padded(magic: &[u8], len: usize) -> Vec<u8> {

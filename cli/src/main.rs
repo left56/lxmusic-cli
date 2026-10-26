@@ -291,8 +291,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     println!("音质：{}", report.quality);
                 }
                 println!("大小：{}", bytes_text(report.bytes));
-                if let Some(path) = &report.info_path {
-                    println!("歌曲信息：{path}");
+                if report.tagged {
+                    println!("歌曲信息：已写入音频标签");
+                    if !report.info_note.is_empty() {
+                        println!("{}", report.info_note);
+                    }
+                } else if !report.info_note.is_empty() {
+                    println!("歌曲信息：{}", report.info_note);
                 }
                 if let Some(path) = &report.lyric_path {
                     println!("歌词：{path}");
